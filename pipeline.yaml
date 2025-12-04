@@ -1,0 +1,617 @@
+pipeline:
+  name: MuleSoft CloudHub 2.0 Deployment
+  identifier: mulesoft_cloudhub2_deployment
+  projectIdentifier: <+input>
+  orgIdentifier: <+input>
+  tags:
+    deployment_type: mulesoft
+    target: cloudhub2
+  stages:
+    - stage:
+        name: Build MuleSoft Application
+        identifier: build_mulesoft_app
+        description: Build and package MuleSoft application
+        type: CI
+        spec:
+          cloneCodebase: true
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Maven Build
+                  identifier: maven_build
+                  spec:
+                    connectorRef: <+input>
+                    image: maven:3.9-eclipse-temurin-8
+                    shell: Bash
+                    command: |-
+                      echo "Building MuleSoft Application..."
+                      mvn clean package -DskipTests
+                      
+                      echo "Build completed successfully"
+                      ls -lh target/
+                    envVariables:
+                      MAVEN_OPTS: "-Xmx1024m"
+              - step:
+                  type: Run
+                  name: Run Unit Tests
+                  identifier: run_unit_tests
+                  spec:
+                    connectorRef: <+input>
+                    image: maven:3.9-eclipse-temurin-8
+                    shell: Bash
+                    command: |-
+                      echo "Running MUnit tests..."
+                      mvn test
+                      
+                      echo "Tests completed"
+              - step:
+                  type: Run
+                  name: Publish Artifact
+                  identifier: publish_artifact
+                  spec:
+                    connectorRef: <+input>
+                    image: maven:3.9-eclipse-temurin-8
+                    shell: Bash
+                    command: |-
+                      echo "Publishing artifact to repository..."
+                      # If using Anypoint Exchange
+                      # mvn deploy -DskipTests
+                      
+                      # Copy artifact for deployment
+                      cp target/*.jar /harness/mulesoft-app.jar
+                    outputVariables:
+                      - name: artifact_name
+                        type: String
+                        value: mulesoft-app.jar
+          caching:
+            enabled: true
+            paths:
+              - /root/.m2/repository
+        when:
+          pipelineStatus: Success
+    
+    - stage:
+        name: Deploy to Development
+        identifier: deploy_to_dev
+        description: Deploy MuleSoft application to CloudHub 2.0 Development environment
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - step:
+                  type: ShellScript
+                  name: Deploy to CloudHub 2.0 Dev
+                  identifier: deploy_cloudhub2_dev
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    source:
+                      type: Inline
+                      spec:
+                        script: |-
+                          #!/bin/bash
+                          set -e
+                          
+                          echo "=== MuleSoft CloudHub 2.0 Deployment Script ==="
+                          
+                          # Configuration
+                          ENVIRONMENT="<+stage.variables.environment>"
+                          APP_NAME="<+stage.variables.app_name>"
+                          REGION="<+stage.variables.region>"
+                          REPLICAS="<+stage.variables.replicas>"
+                          VCORES="<+stage.variables.vcores>"
+                          
+                          # Anypoint Platform credentials (use Harness secrets)
+                          ANYPOINT_USERNAME="<+secrets.getValue('anypoint_username')>"
+                          ANYPOINT_PASSWORD="<+secrets.getValue('anypoint_password')>"
+                          ANYPOINT_ORG_ID="<+secrets.getValue('anypoint_org_id')>"
+                          ANYPOINT_ENV_ID="<+secrets.getValue('anypoint_dev_env_id')>"
+                          
+                          echo "Authenticating with Anypoint Platform..."
+                          ACCESS_TOKEN=$(curl -s -X POST https://anypoint.mulesoft.com/accounts/login \
+                            -H "Content-Type: application/json" \
+                            -d "{\"username\":\"$ANYPOINT_USERNAME\",\"password\":\"$ANYPOINT_PASSWORD\"}" \
+                            | jq -r '.access_token')
+                          
+                          if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" == "null" ]; then
+                            echo "ERROR: Failed to authenticate with Anypoint Platform"
+                            exit 1
+                          fi
+                          
+                          echo "Authentication successful"
+                          
+                          # Check if application exists
+                          echo "Checking if application '$APP_NAME' exists..."
+                          APP_EXISTS=$(curl -s -X GET \
+                            "https://anypoint.mulesoft.com/cloudhub/api/v2/applications/$APP_NAME" \
+                            -H "Authorization: Bearer $ACCESS_TOKEN" \
+                            -H "X-ANYPNT-ENV-ID: $ANYPOINT_ENV_ID" \
+                            -H "X-ANYPNT-ORG-ID: $ANYPOINT_ORG_ID" \
+                            -o /dev/null -w '%{http_code}')
+                          
+                          # Prepare deployment payload
+                          DEPLOYMENT_PAYLOAD=$(cat <<EOF
+                          {
+                            "target": {
+                              "provider": "MC",
+                              "targetId": "$ENVIRONMENT",
+                              "replicas": $REPLICAS,
+                              "deploymentSettings": {
+                                "resources": {
+                                  "cpu": {
+                                    "reserved": "${VCORES}00m",
+                                    "limit": "${VCORES}000m"
+                                  },
+                                  "memory": {
+                                    "reserved": "${VCORES}Gi",
+                                    "limit": "$((VCORES * 2))Gi"
+                                  }
+                                },
+                                "http": {
+                                  "inbound": {
+                                    "publicUrl": "$APP_NAME.${REGION}.cloudhub.io"
+                                  }
+                                },
+                                "jvm": {
+                                  "args": "-XX:MaxRAMPercentage=80.0"
+                                }
+                              }
+                            },
+                            "application": {
+                              "ref": {
+                                "groupId": "<+stage.variables.groupId>",
+                                "artifactId": "<+stage.variables.artifactId>",
+                                "version": "<+stage.variables.version>",
+                                "packaging": "jar"
+                              },
+                              "configuration": {
+                                "mule.agent.application.properties.service": {
+                                  "properties": {
+                                    "env": "dev",
+                                    "encryption.key": "<+secrets.getValue('mule_encryption_key')>"
+                                  }
+                                }
+                              }
+                            }
+                          }
+                          EOF
+                          )
+                          
+                          if [ "$APP_EXISTS" == "200" ]; then
+                            echo "Application exists. Updating deployment..."
+                            RESPONSE=$(curl -s -X PUT \
+                              "https://anypoint.mulesoft.com/cloudhub/api/v2/applications/$APP_NAME" \
+                              -H "Authorization: Bearer $ACCESS_TOKEN" \
+                              -H "X-ANYPNT-ENV-ID: $ANYPOINT_ENV_ID" \
+                              -H "X-ANYPNT-ORG-ID: $ANYPOINT_ORG_ID" \
+                              -H "Content-Type: application/json" \
+                              -d "$DEPLOYMENT_PAYLOAD")
+                          else
+                            echo "Application does not exist. Creating new deployment..."
+                            RESPONSE=$(curl -s -X POST \
+                              "https://anypoint.mulesoft.com/cloudhub/api/v2/applications" \
+                              -H "Authorization: Bearer $ACCESS_TOKEN" \
+                              -H "X-ANYPNT-ENV-ID: $ANYPOINT_ENV_ID" \
+                              -H "X-ANYPNT-ORG-ID: $ANYPOINT_ORG_ID" \
+                              -H "Content-Type: application/json" \
+                              -d "$DEPLOYMENT_PAYLOAD")
+                          fi
+                          
+                          echo "Deployment Response:"
+                          echo "$RESPONSE" | jq '.'
+                          
+                          # Check deployment status
+                          echo "Waiting for deployment to complete..."
+                          MAX_WAIT=600  # 10 minutes
+                          ELAPSED=0
+                          
+                          while [ $ELAPSED -lt $MAX_WAIT ]; do
+                            STATUS=$(curl -s -X GET \
+                              "https://anypoint.mulesoft.com/cloudhub/api/v2/applications/$APP_NAME" \
+                              -H "Authorization: Bearer $ACCESS_TOKEN" \
+                              -H "X-ANYPNT-ENV-ID: $ANYPOINT_ENV_ID" \
+                              -H "X-ANYPNT-ORG-ID: $ANYPOINT_ORG_ID" \
+                              | jq -r '.status')
+                            
+                            echo "Current status: $STATUS"
+                            
+                            if [ "$STATUS" == "RUNNING" ]; then
+                              echo "✓ Deployment successful! Application is running."
+                              exit 0
+                            elif [ "$STATUS" == "FAILED" ]; then
+                              echo "✗ Deployment failed!"
+                              exit 1
+                            fi
+                            
+                            sleep 30
+                            ELAPSED=$((ELAPSED + 30))
+                          done
+                          
+                          echo "Deployment timeout. Please check Anypoint Platform for status."
+                          exit 1
+                    environmentVariables: []
+                    outputVariables:
+                      - name: deployment_status
+                        type: String
+                        value: deployment_complete
+                  timeout: 15m
+              - step:
+                  type: ShellScript
+                  name: Health Check
+                  identifier: health_check
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    source:
+                      type: Inline
+                      spec:
+                        script: |-
+                          #!/bin/bash
+                          
+                          APP_NAME="<+stage.variables.app_name>"
+                          REGION="<+stage.variables.region>"
+                          HEALTH_ENDPOINT="https://$APP_NAME.${REGION}.cloudhub.io/health"
+                          
+                          echo "Performing health check on $HEALTH_ENDPOINT"
+                          
+                          RESPONSE=$(curl -s -o /dev/null -w '%{http_code}' "$HEALTH_ENDPOINT")
+                          
+                          if [ "$RESPONSE" == "200" ]; then
+                            echo "✓ Health check passed! Application is healthy."
+                            exit 0
+                          else
+                            echo "✗ Health check failed. HTTP Status: $RESPONSE"
+                            exit 1
+                          fi
+                    environmentVariables: []
+                  timeout: 5m
+                  failureStrategies:
+                    - onFailure:
+                        errors:
+                          - AllErrors
+                        action:
+                          type: Retry
+                          spec:
+                            retryCount: 3
+                            retryIntervals:
+                              - 30s
+                            onRetryFailure:
+                              action:
+                                type: MarkAsFailure
+        tags: {}
+        variables:
+          - name: environment
+            type: String
+            description: CloudHub 2.0 environment name
+            required: true
+            value: <+input>
+          - name: app_name
+            type: String
+            description: MuleSoft application name
+            required: true
+            value: <+input>
+          - name: region
+            type: String
+            description: CloudHub 2.0 region
+            required: true
+            value: <+input>.allowedValues(us-east-1,us-east-2,us-west-2,eu-central-1,ap-southeast-1,ap-southeast-2)
+          - name: replicas
+            type: String
+            description: Number of replicas
+            required: true
+            value: "1"
+          - name: vcores
+            type: String
+            description: Number of vCores per replica
+            required: true
+            value: <+input>.allowedValues(0.1,0.2,0.5,1,1.5,2,3,4)
+          - name: groupId
+            type: String
+            description: Maven groupId
+            required: true
+            value: <+input>
+          - name: artifactId
+            type: String
+            description: Maven artifactId
+            required: true
+            value: <+input>
+          - name: version
+            type: String
+            description: Application version
+            required: true
+            value: <+input>
+        when:
+          pipelineStatus: Success
+          condition: <+stage.variables.deploy_to_dev> == "true"
+    
+    - stage:
+        name: Deploy to Production
+        identifier: deploy_to_prod
+        description: Deploy MuleSoft application to CloudHub 2.0 Production environment
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - step:
+                  type: HarnessApproval
+                  name: Production Approval
+                  identifier: production_approval
+                  spec:
+                    approvalMessage: |-
+                      Please review and approve deployment to Production
+                      
+                      Application: <+stage.variables.app_name>
+                      Version: <+stage.variables.version>
+                      Environment: Production
+                      Region: <+stage.variables.region>
+                    includePipelineExecutionHistory: true
+                    approvers:
+                      minimumCount: 1
+                      disallowPipelineExecutor: false
+                      userGroups:
+                        - account.admin
+                    approverInputs: []
+                  timeout: 1d
+              - step:
+                  type: ShellScript
+                  name: Deploy to CloudHub 2.0 Prod
+                  identifier: deploy_cloudhub2_prod
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    source:
+                      type: Inline
+                      spec:
+                        script: |-
+                          #!/bin/bash
+                          set -e
+                          
+                          echo "=== Production Deployment to CloudHub 2.0 ==="
+                          
+                          # Configuration (use production values)
+                          ENVIRONMENT="<+stage.variables.environment>"
+                          APP_NAME="<+stage.variables.app_name>"
+                          REGION="<+stage.variables.region>"
+                          REPLICAS="<+stage.variables.replicas>"
+                          VCORES="<+stage.variables.vcores>"
+                          
+                          # Production credentials
+                          ANYPOINT_USERNAME="<+secrets.getValue('anypoint_username')>"
+                          ANYPOINT_PASSWORD="<+secrets.getValue('anypoint_password')>"
+                          ANYPOINT_ORG_ID="<+secrets.getValue('anypoint_org_id')>"
+                          ANYPOINT_ENV_ID="<+secrets.getValue('anypoint_prod_env_id')>"
+                          
+                          echo "Authenticating with Anypoint Platform..."
+                          ACCESS_TOKEN=$(curl -s -X POST https://anypoint.mulesoft.com/accounts/login \
+                            -H "Content-Type: application/json" \
+                            -d "{\"username\":\"$ANYPOINT_USERNAME\",\"password\":\"$ANYPOINT_PASSWORD\"}" \
+                            | jq -r '.access_token')
+                          
+                          if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" == "null" ]; then
+                            echo "ERROR: Failed to authenticate"
+                            exit 1
+                          fi
+                          
+                          echo "Deploying to production with $REPLICAS replicas and $VCORES vCores..."
+                          
+                          # Production deployment payload
+                          DEPLOYMENT_PAYLOAD=$(cat <<EOF
+                          {
+                            "target": {
+                              "provider": "MC",
+                              "targetId": "$ENVIRONMENT",
+                              "replicas": $REPLICAS,
+                              "deploymentSettings": {
+                                "resources": {
+                                  "cpu": {
+                                    "reserved": "${VCORES}00m",
+                                    "limit": "${VCORES}000m"
+                                  },
+                                  "memory": {
+                                    "reserved": "${VCORES}Gi",
+                                    "limit": "$((VCORES * 2))Gi"
+                                  }
+                                },
+                                "http": {
+                                  "inbound": {
+                                    "publicUrl": "$APP_NAME.${REGION}.cloudhub.io"
+                                  }
+                                },
+                                "jvm": {
+                                  "args": "-XX:MaxRAMPercentage=80.0 -Dfile.encoding=UTF-8"
+                                }
+                              }
+                            },
+                            "application": {
+                              "ref": {
+                                "groupId": "<+stage.variables.groupId>",
+                                "artifactId": "<+stage.variables.artifactId>",
+                                "version": "<+stage.variables.version>",
+                                "packaging": "jar"
+                              },
+                              "configuration": {
+                                "mule.agent.application.properties.service": {
+                                  "properties": {
+                                    "env": "prod",
+                                    "encryption.key": "<+secrets.getValue('mule_encryption_key_prod')>"
+                                  }
+                                }
+                              }
+                            }
+                          }
+                          EOF
+                          )
+                          
+                          RESPONSE=$(curl -s -X PUT \
+                            "https://anypoint.mulesoft.com/cloudhub/api/v2/applications/$APP_NAME" \
+                            -H "Authorization: Bearer $ACCESS_TOKEN" \
+                            -H "X-ANYPNT-ENV-ID: $ANYPOINT_ENV_ID" \
+                            -H "X-ANYPNT-ORG-ID: $ANYPOINT_ORG_ID" \
+                            -H "Content-Type: application/json" \
+                            -d "$DEPLOYMENT_PAYLOAD")
+                          
+                          echo "Deployment initiated"
+                          echo "$RESPONSE" | jq '.'
+                          
+                          # Monitor deployment
+                          echo "Monitoring deployment status..."
+                          MAX_WAIT=900  # 15 minutes for production
+                          ELAPSED=0
+                          
+                          while [ $ELAPSED -lt $MAX_WAIT ]; do
+                            STATUS=$(curl -s -X GET \
+                              "https://anypoint.mulesoft.com/cloudhub/api/v2/applications/$APP_NAME" \
+                              -H "Authorization: Bearer $ACCESS_TOKEN" \
+                              -H "X-ANYPNT-ENV-ID: $ANYPOINT_ENV_ID" \
+                              -H "X-ANYPNT-ORG-ID: $ANYPOINT_ORG_ID" \
+                              | jq -r '.status')
+                            
+                            echo "[$(date +%T)] Status: $STATUS"
+                            
+                            if [ "$STATUS" == "RUNNING" ]; then
+                              echo "✓ Production deployment successful!"
+                              exit 0
+                            elif [ "$STATUS" == "FAILED" ]; then
+                              echo "✗ Production deployment failed!"
+                              exit 1
+                            fi
+                            
+                            sleep 45
+                            ELAPSED=$((ELAPSED + 45))
+                          done
+                          
+                          echo "Deployment monitoring timeout"
+                          exit 1
+                    environmentVariables: []
+                  timeout: 20m
+              - step:
+                  type: ShellScript
+                  name: Production Health Check
+                  identifier: prod_health_check
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    source:
+                      type: Inline
+                      spec:
+                        script: |-
+                          #!/bin/bash
+                          
+                          APP_NAME="<+stage.variables.app_name>"
+                          REGION="<+stage.variables.region>"
+                          HEALTH_ENDPOINT="https://$APP_NAME.${REGION}.cloudhub.io/health"
+                          
+                          echo "Production health check: $HEALTH_ENDPOINT"
+                          
+                          for i in {1..5}; do
+                            RESPONSE=$(curl -s -o /dev/null -w '%{http_code}' "$HEALTH_ENDPOINT")
+                            
+                            if [ "$RESPONSE" == "200" ]; then
+                              echo "✓ Health check $i/5 passed"
+                            else
+                              echo "✗ Health check $i/5 failed (HTTP $RESPONSE)"
+                              exit 1
+                            fi
+                            
+                            sleep 10
+                          done
+                          
+                          echo "✓ All production health checks passed!"
+                    environmentVariables: []
+                  timeout: 5m
+              - step:
+                  type: ShellScript
+                  name: Send Notification
+                  identifier: send_notification
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    source:
+                      type: Inline
+                      spec:
+                        script: |-
+                          #!/bin/bash
+                          
+                          echo "Production deployment completed successfully!"
+                          echo "Application: <+stage.variables.app_name>"
+                          echo "Version: <+stage.variables.version>"
+                          echo "Region: <+stage.variables.region>"
+                          echo "URL: https://<+stage.variables.app_name>.<+stage.variables.region>.cloudhub.io"
+                    environmentVariables: []
+                  timeout: 2m
+        tags: {}
+        variables:
+          - name: environment
+            type: String
+            description: CloudHub 2.0 production environment name
+            required: true
+            value: <+input>
+          - name: app_name
+            type: String
+            description: MuleSoft application name
+            required: true
+            value: <+input>
+          - name: region
+            type: String
+            description: CloudHub 2.0 region
+            required: true
+            value: <+input>.allowedValues(us-east-1,us-east-2,us-west-2,eu-central-1,ap-southeast-1,ap-southeast-2)
+          - name: replicas
+            type: String
+            description: Number of replicas (production should use 2+)
+            required: true
+            value: "2"
+          - name: vcores
+            type: String
+            description: Number of vCores per replica
+            required: true
+            value: <+input>.allowedValues(0.5,1,1.5,2,3,4)
+          - name: groupId
+            type: String
+            description: Maven groupId
+            required: true
+            value: <+pipeline.stages.build_mulesoft_app.spec.execution.steps.publish_artifact.output.outputVariables.groupId>
+          - name: artifactId
+            type: String
+            description: Maven artifactId
+            required: true
+            value: <+pipeline.stages.build_mulesoft_app.spec.execution.steps.publish_artifact.output.outputVariables.artifactId>
+          - name: version
+            type: String
+            description: Application version
+            required: true
+            value: <+pipeline.stages.build_mulesoft_app.spec.execution.steps.publish_artifact.output.outputVariables.version>
+        when:
+          pipelineStatus: Success
+          condition: <+pipeline.variables.deploy_to_prod> == "true"
+  variables:
+    - name: deploy_to_dev
+      type: String
+      description: Deploy to development environment
+      required: false
+      value: "true"
+    - name: deploy_to_prod
+      type: String
+      description: Deploy to production environment
+      required: false
+      value: "false"
+  notificationRules:
+    - name: Pipeline Failure Notification
+      identifier: pipeline_failure
+      pipelineEvents:
+        - type: AllEvents
+      notificationMethod:
+        type: Email
+        spec:
+          userGroups:
+            - account.admin
+          recipients:
+            - <+pipeline.triggeredBy.email>
+      enabled: true
